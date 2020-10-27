@@ -6,7 +6,7 @@ A monitoring solution for Docker hosts and containers with [Prometheus](https://
 
 Like [this](https://github.com/A-styler/docker-compose-monitoring-stack/edit/master/README.md) solution, but without docker-compose.
 
-Prerequisites:
+## Prerequisites:
 
 * Ansible
 * Docker Engine
