@@ -1,0 +1,294 @@
+---
+#- name: Install Docker-CE and composer
+#  hosts: monitoring
+#  roles:
+#    - docker
+#
+#- name: Install Traefik
+#  hosts: monitoring
+#  vars:
+#    traefik_debug: false
+#    traefik_network: proxy
+#    traefik_dir: "/opt/traefik"
+#  roles:
+#    - traefik
+
+- name: Create monitoring network
+  hosts: monitoring
+  vars:
+    monitoring_network: monitoring
+  tasks:
+    - name: Create monitoring network
+      become: true
+      docker_network:
+        name: "{{ monitoring_network }}"
+        state: present
+
+- name: Create Monitoring directory
+  hosts: monitoring
+  vars:
+    monitoring_home: /opt/monitoring
+  tasks:
+    - name: Create Monitoring directory
+      file: 
+        path: "{{ monitoring_home }}"
+        state: directory
+        mode: '0750'
+        owner: root
+        group: root
+
+- name: Run Node Exporter
+  hosts: monitoring
+  vars:
+    node_exporter_version: v1.0.1
+  tasks:
+    - name: Run Node Exporter container
+      docker_container:
+        name: node-exporter
+        image: "prom/node-exporter:{{ node_exporter_version }}"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "/proc:/host/proc:ro"
+          - "/sys:/host/sys:ro"
+          - "/:/rootfs:ro"
+        exposed_ports:
+          - "9100"
+        networks_cli_compatible: yes
+        networks:
+          - name: monitoring
+        #recreate: yes
+        command:
+          - '--path.procfs=/host/proc'
+          - '--path.rootfs=/rootfs'
+          - '--path.sysfs=/host/sys'
+          - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+
+- name: Run VictoriaMetrics
+  hosts: monitoring
+  vars:
+    victoriametrics_version: v1.41.1
+    monitoring_home: /home/monitoring
+  tasks:
+    - name: Create VictoriaMetrics volume
+      docker_volume:
+        name: victoriametrics_data
+        state: present
+    - name: Run VictoriaMetrics container
+      docker_container:
+        name: victoriametrics
+        image: "victoriametrics/victoria-metrics:{{ victoriametrics_version }}"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - victoriametrics_data:/storage
+        exposed_ports:
+          - "8428"
+        networks_cli_compatible: yes
+        networks:
+          - name: monitoring
+        #recreate: yes
+        command:
+          - '--storageDataPath=/storage'
+          - '--httpListenAddr=:8428'
+          - '--retentionPeriod=180'
+
+- name: Run Prometheus
+  hosts: monitoring
+  vars:
+    prometheus_version: v2.21.0
+    monitoring_home: /opt/monitoring
+  tasks:
+    - name: Create Prometheus volume
+      docker_volume:
+        name: prometheus_data
+        state: present
+    - name: Create Prometheus directory
+      file: 
+        path: "{{ monitoring_home }}/prometheus"
+        state: directory
+        mode: '0750'
+        owner: root
+        group: root
+    - name: Copy Prometheus config
+      copy:
+        src: "files/prometheus/prometheus.yml"
+        dest: "{{ monitoring_home }}/prometheus/prometheus.yml"
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Run Prometheus container
+      docker_container:
+        name: prometheus
+        image: prom/prometheus:{{ prometheus_version }}
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ monitoring_home }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml"
+          - prometheus_data:/prometheus
+        exposed_ports:
+          - "9100"
+        networks_cli_compatible: yes
+        networks:
+          - name: monitoring
+        recreate: yes
+        timeout: 600
+        command:
+          - '--config.file=/etc/prometheus/prometheus.yml'
+          - '--storage.tsdb.path=/prometheus'
+          - '--web.console.libraries=/etc/prometheus/console_libraries'
+          - '--web.console.templates=/etc/prometheus/consoles'
+          - '--storage.tsdb.retention=7d'
+          - '--web.enable-lifecycle'
+
+- name: Run blackbox-exporter
+  hosts: monitoring
+  vars:
+    blackbox_version: v0.16.0
+    monitoring_home: /opt/monitoring
+  tasks:
+    - name: Create blackbox directory
+      file: 
+        path: "{{ monitoring_home }}/blackbox"
+        state: directory
+        mode: '0750'
+        owner: root
+        group: root
+    - name: Copy blackbox config
+      copy:
+        src: "files/blackbox-exporter/config.yml"
+        dest: "{{ monitoring_home }}/blackbox-exporter/config.yml"
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Run blackbox container
+      docker_container:
+        name: blackbox-exporter
+        image: prom/blackbox-exporter:{{ blackbox_version }}
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ monitoring_home }}/blackbox-exporter/config.yml:/etc/blackbox/config.yml"
+        exposed_ports:
+          - "9115"
+        networks_cli_compatible: yes
+        networks:
+          - name: monitoring
+        #recreate: yes
+        command:
+          - "--config.file=/etc/blackbox/config.yml"
+
+- name: Run vmalert and Alertmanager support
+  hosts: monitoring
+  vars:
+    alertmanager_version: v0.21.0
+    vmalert_version: v1.41.1
+    monitoring_home: /opt/monitoring
+  tasks:
+    - name: Create Alertmanager directory
+      file: 
+        path: "{{ monitoring_home }}/alertmanager"
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+    - name: Copy Alertmanager config
+      copy:
+        src: "files/alertmanager/{{ item }}"
+        dest: "{{ monitoring_home }}/alertmanager/{{ item }}"
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - config.yml
+        - rules.yml
+      loop_control:
+        label: "{{ item }}"
+    - name: Run vmalert container
+      docker_container:
+        name: vmalert
+        image: "victoriametrics/vmalert:{{ vmalert_version }}"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ monitoring_home }}/alertmanager:/alertmanager"
+        networks_cli_compatible: yes
+        networks:
+          - name: monitoring
+        #recreate: yes
+        command:
+          - '-rule=/alertmanager/rules.yml'
+          - '-datasource.url=http://victoriametrics:8428'
+          - '-notifier.url=http://alertmanager:9093'
+    - name: Create Alertmanager volume
+      docker_volume:
+        name: alertmanager_data
+        state: present
+    - name: Run Alertmanager container
+      docker_container:
+        name: alertmanager
+        image: "prom/alertmanager:{{ alertmanager_version }}"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ monitoring_home }}/alertmanager:/etc/alertmanager"
+          - alertmanager_data:/alertmanager
+        networks_cli_compatible: yes
+        networks:
+          - name: monitoring
+        exposed_ports:
+          - "9093"
+        #recreate: yes
+        command:
+          - '--config.file=/etc/alertmanager/config.yml'
+          - '--storage.path=/alertmanager'
+
+- name: Run Grafana
+  hosts: monitoring
+  vars:
+    grafana_version: 7.2.0
+    monitoring_home: /opt/monitoring
+  tasks:
+    - name: Create Grafana directory
+      file: 
+        path: "{{ monitoring_home }}/grafana"
+        state: directory
+        mode: '0750'
+        owner: root
+        group: root
+    - name: Create Grafana volume
+      docker_volume:
+        name: grafana_data
+        state: present
+    - name: Run Grafana container
+      docker_container:
+        name: grafana
+        image: "grafana/grafana:{{ grafana_version }}"
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "grafana_data:/var/lib/grafana"
+        networks_cli_compatible: yes
+        networks:
+          - name: monitoring
+          - name: proxy
+        exposed_ports:
+          - "3000"
+        #recreate: yes
+        env:
+          GF_SECURITY_ADMIN_USER: "${ADMIN_USER:-admin}"
+          GF_SECURITY_ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
+          GF_USERS_ALLOW_SIGN_UP: "false"
+          GF_INSTALL_PLUGINS: "camptocamp-prometheus-alertmanager-datasource"
+        labels:
+          traefik.enable: "true"
+          # Allow 80 with domain
+          traefik.http.routers.grafana.entrypoints: 'web'
+          traefik.http.routers.grafana.rule: 'Host(`your.grafana.com`)'
+          # Redirect to 443
+          #traefik.http.middlewares.traefik-redirectscheme.redirectscheme.scheme: 'https'
+          #traefik.http.routers.grafana.middlewares: 'traefik-redirectscheme'
+          # Allow 443 with domain
+          traefik.http.routers.grafana-ssl.entrypoints: 'websecure'
+          traefik.http.routers.grafana-ssl.tls.certresolver: 'myresolver'
+          traefik.http.routers.grafana-ssl.rule: 'Host(`your.grafana.com`)'
